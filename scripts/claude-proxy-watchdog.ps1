@@ -27,32 +27,42 @@ function Start-Proxy {
     return $process
 }
 
-function Check-Process {
-    if (Test-Path $pidFile) {
-        $pid = Get-Content $pidFile
-        try {
-            $process = Get-Process -Id $pid -ErrorAction Stop
-            return $true
-        } catch {
-            return $false
-        }
+function Test-ProxyHealth {
+    try {
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:9182/health" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        return $response.StatusCode -eq 200
+    } catch {
+        return $false
     }
-    return $false
 }
 
 Log "Watchdog started"
 
-# Initial start
-if (-not (Check-Process)) {
-    Start-Proxy
+# Initial start - only launch if health check fails
+if (-not (Test-ProxyHealth)) {
+    # Check if something is already on port 9182
+    $portInUse = Get-NetTCPConnection -LocalPort 9182 -ErrorAction SilentlyContinue
+    if ($portInUse) {
+        Log "Port 9182 in use (PID: $($portInUse[0].OwningProcess)) but health check failed. Skipping start."
+    } else {
+        Start-Proxy
+    }
+} else {
+    Log "Proxy already healthy. Monitoring."
 }
 
 # Monitor loop - check every 60 seconds
 while ($true) {
     Start-Sleep -Seconds 60
 
-    if (-not (Check-Process)) {
-        Log "claude-proxy is down. Restarting..."
+    if (-not (Test-ProxyHealth)) {
+        Log "Health check failed. Checking port..."
+        $portInUse = Get-NetTCPConnection -LocalPort 9182 -ErrorAction SilentlyContinue
+        if ($portInUse) {
+            Log "Port 9182 in use (PID: $($portInUse[0].OwningProcess)) but not responding. Killing stale process..."
+            Stop-Process -Id $portInUse[0].OwningProcess -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        }
         Start-Proxy
     }
 }

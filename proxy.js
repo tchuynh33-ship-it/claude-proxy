@@ -7,6 +7,7 @@
 
 const http = require("http");
 const { spawn } = require("child_process");
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
@@ -14,6 +15,30 @@ const PORT = process.env.PROXY_PORT || 9182;
 const MAX_PROMPT_CHARS = 80000;
 const CLAUDE_TIMEOUT_MS = 180000; // 3 min timeout
 const MAX_CONCURRENT = 3;
+
+// --- Structured file logging ---
+const LOG_DIR = path.join(__dirname, "logs");
+const LOG_FILE = path.join(LOG_DIR, "requests.jsonl");
+const MAX_LOG_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB, rotate after this
+
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+function rotateLogIfNeeded() {
+  try {
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > MAX_LOG_SIZE) {
+      const rotated = LOG_FILE.replace(".jsonl", `.${Date.now()}.jsonl`);
+      fs.renameSync(LOG_FILE, rotated);
+    }
+  } catch {}
+}
+
+function logRequest(entry) {
+  rotateLogIfNeeded();
+  fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
+}
+
+let requestCounter = 0;
 
 // Remove API keys so child processes use subscription
 delete process.env.ANTHROPIC_API_KEY;
@@ -112,7 +137,7 @@ function resolveModelAlias(modelId) {
 }
 
 // Run claude -p with real-time streaming, piping SSE events back to the HTTP response
-function runClaudeStreaming(prompt, model, res) {
+function runClaudeStreaming(prompt, model, res, reqId, startTime) {
   return enqueue(() => new Promise((resolve, reject) => {
     const alias = resolveModelAlias(model);
     const args = [
@@ -128,6 +153,8 @@ function runClaudeStreaming(prompt, model, res) {
     let finished = false;
     let killed = false;
     let buffer = "";
+    let ttfbMs = null;
+    let fullResponse = "";
 
     console.log(`[proxy] Spawning claude -p --model ${alias} streaming (prompt=${prompt.length} chars, active=${activeCount}, queued=${queue.length})`);
 
@@ -190,8 +217,10 @@ function runClaudeStreaming(prompt, model, res) {
 
     function sendDelta(text) {
       if (!text) return;
+      if (ttfbMs === null) ttfbMs = Date.now() - startTime;
       sendHeaders();
       totalOutput += text.length;
+      fullResponse += text;
       sendSSE(res, "content_block_delta", {
         type: "content_block_delta",
         index: 0,
@@ -217,8 +246,8 @@ function runClaudeStreaming(prompt, model, res) {
       });
       sendSSE(res, "message_stop", { type: "message_stop" });
       res.end();
-      console.log(`[proxy] Stream complete (${totalOutput} chars output)`);
-      resolve();
+      console.log(`[proxy] ${reqId} Stream complete (${totalOutput} chars, ttfb=${ttfbMs}ms, total=${Date.now() - startTime}ms)`);
+      resolve({ totalOutput, ttfbMs, fullResponse });
     }
 
     // Process JSONL lines from claude's stream-json output
@@ -369,6 +398,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Recent request logs — last N entries
+  if (req.url.startsWith("/logs")) {
+    const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500);
+    try {
+      const raw = fs.readFileSync(LOG_FILE, "utf8").trim();
+      const lines = raw ? raw.split("\n") : [];
+      const recent = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ count: recent.length, total: lines.length, entries: recent }));
+    } catch {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ count: 0, total: 0, entries: [] }));
+    }
+    return;
+  }
+
   if (req.url === "/v1/messages" && req.method === "POST") {
     let rawBody = "";
     for await (const chunk of req) rawBody += chunk;
@@ -383,15 +429,56 @@ const server = http.createServer(async (req, res) => {
     const prompt = extractPrompt(body);
     const model = body.model;
     const isStream = body.stream === true;
+    const reqId = `req_${Date.now()}_${++requestCounter}`;
+    const startTime = Date.now();
 
-    console.log(`[proxy] ${new Date().toISOString()} model=${model} stream=${isStream} prompt_len=${prompt.length}`);
+    // Count messages and tokens estimate
+    const msgCount = (body.messages || []).length;
+    const rawBodyLen = rawBody.length;
+
+    console.log(`[proxy] ${new Date().toISOString()} ${reqId} model=${model} stream=${isStream} prompt_len=${prompt.length} raw_body=${rawBodyLen} msgs=${msgCount}`);
 
     if (isStream) {
       // Real-time streaming: pipe claude output directly as SSE
       try {
-        await runClaudeStreaming(prompt, model, res);
+        const result = await runClaudeStreaming(prompt, model, res, reqId, startTime);
+        logRequest({
+          ts: new Date().toISOString(),
+          reqId,
+          model,
+          alias: resolveModelAlias(model),
+          stream: true,
+          promptChars: prompt.length,
+          rawBodyBytes: rawBodyLen,
+          messageCount: msgCount,
+          responseChars: result.totalOutput,
+          ttfbMs: result.ttfbMs,
+          durationMs: Date.now() - startTime,
+          status: "ok",
+          active: activeCount,
+          queued: queue.length,
+          prompt: prompt.substring(0, 2000),
+          response: result.fullResponse.substring(0, 2000),
+        });
       } catch (err) {
         console.error(`[proxy] Stream error: ${err.message}`);
+        logRequest({
+          ts: new Date().toISOString(),
+          reqId,
+          model,
+          alias: resolveModelAlias(model),
+          stream: true,
+          promptChars: prompt.length,
+          rawBodyBytes: rawBodyLen,
+          messageCount: msgCount,
+          responseChars: 0,
+          durationMs: Date.now() - startTime,
+          status: "error",
+          error: err.message,
+          active: activeCount,
+          queued: queue.length,
+          prompt: prompt.substring(0, 2000),
+        });
         // Response may already be partially sent
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -405,8 +492,42 @@ const server = http.createServer(async (req, res) => {
         if (!text) throw new Error("Empty response");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(buildResponse(text, model)));
+        logRequest({
+          ts: new Date().toISOString(),
+          reqId,
+          model,
+          alias: resolveModelAlias(model),
+          stream: false,
+          promptChars: prompt.length,
+          rawBodyBytes: rawBodyLen,
+          messageCount: msgCount,
+          responseChars: text.length,
+          durationMs: Date.now() - startTime,
+          status: "ok",
+          active: activeCount,
+          queued: queue.length,
+          prompt: prompt.substring(0, 2000),
+          response: text.substring(0, 2000),
+        });
       } catch (err) {
         console.error(`[proxy] Error: ${err.message}`);
+        logRequest({
+          ts: new Date().toISOString(),
+          reqId,
+          model,
+          alias: resolveModelAlias(model),
+          stream: false,
+          promptChars: prompt.length,
+          rawBodyBytes: rawBodyLen,
+          messageCount: msgCount,
+          responseChars: 0,
+          durationMs: Date.now() - startTime,
+          status: "error",
+          error: err.message,
+          active: activeCount,
+          queued: queue.length,
+          prompt: prompt.substring(0, 2000),
+        });
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }));
       }
@@ -423,4 +544,6 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`[claude-proxy] Real-time streaming enabled`);
   console.log(`[claude-proxy] Max concurrent: ${MAX_CONCURRENT}, timeout: ${CLAUDE_TIMEOUT_MS / 1000}s`);
   console.log(`[claude-proxy] Claude binary: ${claudePath}`);
+  console.log(`[claude-proxy] Request log: ${LOG_FILE}`);
+  console.log(`[claude-proxy] Log viewer: http://127.0.0.1:${PORT}/logs?limit=20`);
 });
