@@ -15,6 +15,29 @@ const PORT = process.env.PROXY_PORT || 9182;
 const MAX_PROMPT_CHARS = 80000;
 const CLAUDE_TIMEOUT_MS = 180000; // 3 min timeout
 const MAX_CONCURRENT = 3;
+const PROJECTS_ROOT = path.join(os.homedir(), ".openclaw", "projects");
+const OPENCLAW_JSON = path.join(os.homedir(), ".openclaw", "openclaw.json");
+
+// Map of session-name -> project directory.
+// Session is selected per-request from the OpenClaw peer ID embedded in the
+// user message metadata blob (OpenClaw strips the model `@suffix` upstream,
+// so we can't rely on that). DM/dashboard requests default to "main".
+const SESSION_PROJECTS = {
+  main: path.join(PROJECTS_ROOT, "openclaw-main"),
+  misc: path.join(PROJECTS_ROOT, "openclaw-misc"),
+  "barreleyes": path.join(PROJECTS_ROOT, "openclaw-barreleyes"),
+  "viet-translator": path.join(PROJECTS_ROOT, "openclaw-viet-translator"),
+  "poe2": path.join(PROJECTS_ROOT, "openclaw-poe2"),
+  "content": path.join(PROJECTS_ROOT, "openclaw-content"),
+  "devtools": path.join(PROJECTS_ROOT, "openclaw-devtools"),
+  "ai-data": path.join(PROJECTS_ROOT, "openclaw-ai-data"),
+  "barreleyes-1": path.join(PROJECTS_ROOT, "openclaw-barreleyes-1"),
+  "roboflow": path.join(PROJECTS_ROOT, "openclaw-roboflow"),
+  "shopping": path.join(PROJECTS_ROOT, "openclaw-shopping"),
+  "misc-web": path.join(PROJECTS_ROOT, "openclaw-misc-web"),
+  "woodworking": path.join(PROJECTS_ROOT, "openclaw-woodworking"),
+  "fixmyform": path.join(PROJECTS_ROOT, "openclaw-fixmyform"),
+};
 
 // --- Structured file logging ---
 const LOG_DIR = path.join(__dirname, "logs");
@@ -130,14 +153,95 @@ function extractPrompt(body) {
 
 function resolveModelAlias(modelId) {
   if (!modelId) return "sonnet";
-  const lower = modelId.toLowerCase();
+  // Strip the @session suffix before alias resolution.
+  const base = modelId.split("@")[0];
+  const lower = base.toLowerCase();
   if (lower.includes("opus")) return "opus";
   if (lower.includes("haiku")) return "haiku";
   return "sonnet";
 }
 
-// Run claude -p with real-time streaming, piping SSE events back to the HTTP response
-function runClaudeStreaming(prompt, model, res, reqId, startTime) {
+// Build peerId -> sessionName map from openclaw.json bindings (read once at startup).
+// Reload on SIGHUP if you ever need it.
+function loadPeerSessionMap() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(OPENCLAW_JSON, "utf8"));
+    const map = {};
+    for (const b of cfg.bindings || []) {
+      const peerId = b.match?.peer?.id;
+      const agentId = b.agentId;
+      if (peerId && agentId && SESSION_PROJECTS[agentId]) {
+        map[peerId] = agentId;
+      }
+    }
+    return map;
+  } catch (e) {
+    console.error(`[proxy] Could not load openclaw.json bindings: ${e.message}`);
+    return {};
+  }
+}
+
+let PEER_SESSION_MAP = loadPeerSessionMap();
+console.log(`[proxy] Loaded ${Object.keys(PEER_SESSION_MAP).length} peer->session bindings`);
+
+// Extract OpenClaw peer ID and is_group_chat from the latest user message metadata.
+// OpenClaw embeds a JSON block at the start of each user message like:
+//   "conversation_label": "Woodworking id:-5201959106",
+//   "is_group_chat": true
+function extractPeerInfo(body) {
+  const msgs = body.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role !== "user") continue;
+    const txt = typeof m.content === "string"
+      ? m.content
+      : (Array.isArray(m.content) ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n") : "");
+    const idMatch = txt.match(/"conversation_label"\s*:\s*"[^"]*id:(-?\d+)"/);
+    const groupMatch = txt.match(/"is_group_chat"\s*:\s*(true|false)/);
+    if (idMatch || groupMatch) {
+      return {
+        peerId: idMatch ? idMatch[1] : null,
+        isGroupChat: groupMatch ? groupMatch[1] === "true" : null,
+      };
+    }
+  }
+  return { peerId: null, isGroupChat: null };
+}
+
+// Extract just the latest user message text from an Anthropic Messages request.
+// Used in session mode — system prompt + history live in CLAUDE.md and the resumed session.
+function extractLatestUserMessage(body) {
+  const messages = body.messages || [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+    }
+  }
+  return "";
+}
+
+// Return true if this session has been initialized (has a flag file in its project dir).
+function sessionInitialized(projectDir) {
+  return fs.existsSync(path.join(projectDir, ".session-initialized"));
+}
+
+function markSessionInitialized(projectDir) {
+  try {
+    fs.writeFileSync(path.join(projectDir, ".session-initialized"), new Date().toISOString());
+  } catch (e) {
+    console.error(`[proxy] Could not mark session initialized for ${projectDir}: ${e.message}`);
+  }
+}
+
+// Run claude -p with real-time streaming, piping SSE events back to the HTTP response.
+// `opts` may include { extraArgs: string[], cwd: string, label: string }.
+function runClaudeStreaming(prompt, model, res, reqId, startTime, opts = {}) {
   return enqueue(() => new Promise((resolve, reject) => {
     const alias = resolveModelAlias(model);
     const args = [
@@ -145,6 +249,7 @@ function runClaudeStreaming(prompt, model, res, reqId, startTime) {
       "--model", alias,
       "--output-format", "stream-json",
       "--verbose",
+      ...(opts.extraArgs || []),
     ];
 
     const msgId = `msg_proxy_${Date.now()}`;
@@ -156,13 +261,15 @@ function runClaudeStreaming(prompt, model, res, reqId, startTime) {
     let ttfbMs = null;
     let fullResponse = "";
 
-    console.log(`[proxy] Spawning claude -p --model ${alias} streaming (prompt=${prompt.length} chars, active=${activeCount}, queued=${queue.length})`);
+    const label = opts.label || `--model ${alias}`;
+    console.log(`[proxy] Spawning claude -p ${label} streaming (prompt=${prompt.length} chars, cwd=${opts.cwd || "default"}, active=${activeCount}, queued=${queue.length})`);
 
     const proc = spawn(claudePath, args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       env: childEnv,
       windowsHide: true,
+      cwd: opts.cwd,
     });
 
     const timer = setTimeout(() => {
@@ -322,19 +429,22 @@ function runClaudeStreaming(prompt, model, res, reqId, startTime) {
   }));
 }
 
-// Run claude -p non-streaming (for non-stream requests)
-function runClaude(prompt, model) {
+// Run claude -p non-streaming (for non-stream requests).
+// `opts` may include { extraArgs: string[], cwd: string, label: string }.
+function runClaude(prompt, model, opts = {}) {
   return enqueue(() => new Promise((resolve, reject) => {
     const alias = resolveModelAlias(model);
-    const args = ["-p", "--model", alias];
+    const args = ["-p", "--model", alias, ...(opts.extraArgs || [])];
 
-    console.log(`[proxy] Spawning claude -p --model ${alias} (prompt=${prompt.length} chars, active=${activeCount}, queued=${queue.length})`);
+    const label = opts.label || `--model ${alias}`;
+    console.log(`[proxy] Spawning claude -p ${label} (prompt=${prompt.length} chars, cwd=${opts.cwd || "default"}, active=${activeCount}, queued=${queue.length})`);
 
     const proc = spawn(claudePath, args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       env: childEnv,
       windowsHide: true,
+      cwd: opts.cwd,
     });
 
     let stdout = "";
@@ -426,27 +536,68 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const prompt = extractPrompt(body);
+    // DEBUG: dump full body + headers to find session identifier
+    try {
+      const dump = {
+        ts: new Date().toISOString(),
+        url: req.url,
+        headers: req.headers,
+        body: body,
+      };
+      fs.appendFileSync(path.join(LOG_DIR, "debug-full.jsonl"), JSON.stringify(dump) + "\n");
+    } catch {}
+
     const model = body.model;
     const isStream = body.stream === true;
     const reqId = `req_${Date.now()}_${++requestCounter}`;
     const startTime = Date.now();
-
-    // Count messages and tokens estimate
     const msgCount = (body.messages || []).length;
     const rawBodyLen = rawBody.length;
 
-    console.log(`[proxy] ${new Date().toISOString()} ${reqId} model=${model} stream=${isStream} prompt_len=${prompt.length} raw_body=${rawBodyLen} msgs=${msgCount}`);
+    // Determine session mode vs legacy mode based on peer ID in the embedded
+    // OpenClaw metadata (model `@suffix` is stripped upstream so we can't use it).
+    const { peerId, isGroupChat } = extractPeerInfo(body);
+    let session = null;
+    if (peerId && PEER_SESSION_MAP[peerId]) {
+      session = PEER_SESSION_MAP[peerId];
+    } else if (isGroupChat === false && SESSION_PROJECTS["main"]) {
+      // 1:1 DMs (and dashboard) -> main session.
+      session = "main";
+    }
+
+    let mode = "legacy";
+    let prompt;
+    let runOpts = {};
+    if (session) {
+      const projectDir = SESSION_PROJECTS[session];
+      mode = "session";
+      prompt = extractLatestUserMessage(body);
+      const initialized = sessionInitialized(projectDir);
+      const flag = initialized ? "-r" : "-n";
+      runOpts = {
+        extraArgs: [flag, session],
+        cwd: projectDir,
+        label: `${flag} ${session}`,
+      };
+      // Mark as initialized eagerly — even if this call fails, claude likely created the session.
+      if (!initialized) markSessionInitialized(projectDir);
+    } else {
+      prompt = extractPrompt(body);
+    }
+
+    console.log(`[proxy] ${new Date().toISOString()} ${reqId} mode=${mode} model=${model} stream=${isStream} prompt_len=${prompt.length} raw_body=${rawBodyLen} msgs=${msgCount}`);
 
     if (isStream) {
       // Real-time streaming: pipe claude output directly as SSE
       try {
-        const result = await runClaudeStreaming(prompt, model, res, reqId, startTime);
+        const result = await runClaudeStreaming(prompt, model, res, reqId, startTime, runOpts);
         logRequest({
           ts: new Date().toISOString(),
           reqId,
           model,
           alias: resolveModelAlias(model),
+          mode,
+          session,
           stream: true,
           promptChars: prompt.length,
           rawBodyBytes: rawBodyLen,
@@ -457,8 +608,8 @@ const server = http.createServer(async (req, res) => {
           status: "ok",
           active: activeCount,
           queued: queue.length,
-          prompt: prompt.substring(0, 2000),
-          response: result.fullResponse.substring(0, 2000),
+          prompt,
+          response: result.fullResponse,
         });
       } catch (err) {
         console.error(`[proxy] Stream error: ${err.message}`);
@@ -467,6 +618,8 @@ const server = http.createServer(async (req, res) => {
           reqId,
           model,
           alias: resolveModelAlias(model),
+          mode,
+          session,
           stream: true,
           promptChars: prompt.length,
           rawBodyBytes: rawBodyLen,
@@ -477,7 +630,7 @@ const server = http.createServer(async (req, res) => {
           error: err.message,
           active: activeCount,
           queued: queue.length,
-          prompt: prompt.substring(0, 2000),
+          prompt,
         });
         // Response may already be partially sent
         if (!res.headersSent) {
@@ -487,7 +640,7 @@ const server = http.createServer(async (req, res) => {
       }
     } else {
       try {
-        const raw = await runClaude(prompt, model);
+        const raw = await runClaude(prompt, model, runOpts);
         const text = raw.trim();
         if (!text) throw new Error("Empty response");
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -497,6 +650,8 @@ const server = http.createServer(async (req, res) => {
           reqId,
           model,
           alias: resolveModelAlias(model),
+          mode,
+          session,
           stream: false,
           promptChars: prompt.length,
           rawBodyBytes: rawBodyLen,
@@ -506,8 +661,8 @@ const server = http.createServer(async (req, res) => {
           status: "ok",
           active: activeCount,
           queued: queue.length,
-          prompt: prompt.substring(0, 2000),
-          response: text.substring(0, 2000),
+          prompt,
+          response: text,
         });
       } catch (err) {
         console.error(`[proxy] Error: ${err.message}`);
@@ -516,6 +671,8 @@ const server = http.createServer(async (req, res) => {
           reqId,
           model,
           alias: resolveModelAlias(model),
+          mode,
+          session,
           stream: false,
           promptChars: prompt.length,
           rawBodyBytes: rawBodyLen,
@@ -526,7 +683,7 @@ const server = http.createServer(async (req, res) => {
           error: err.message,
           active: activeCount,
           queued: queue.length,
-          prompt: prompt.substring(0, 2000),
+          prompt,
         });
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }));

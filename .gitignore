@@ -1,0 +1,21 @@
+# Local junction to ~/.openclaw — contains bot tokens and API keys, never commit
+.openclaw/
+.openclaw
+
+# Runtime
+logs/
+node_modules/
+*.log
+
+# Local test artifacts
+*-screenshots/
+prompt-line107.md
+test-execution.log
+test-v2-execution.log
+final-test.log
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
